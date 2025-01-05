@@ -173,7 +173,7 @@ pub enum EnumAttribute {
     /// `optforfuzzing`
     OptForFuzzing = AttributeId::OptForFuzzing as u64,
     /// `shadowcallstack`
-    Shadowcallstack = AttributeId::Shadowcallstack as u64,
+    ShadowCallStack = AttributeId::ShadowCallStack as u64,
     /// `speculative_load_hardening`
     SpeculativeLoadHardening = AttributeId::SpeculativeLoadHardening as u64,
     /// `immarg`
@@ -219,9 +219,15 @@ pub enum EnumAttribute {
     /// `presplitcoroutine`
     PresplitCoroutine = AttributeId::PresplitCoroutine as u64,
     /// `fn_ret_thunk_extern`
-    FnretthunkExtern = AttributeId::FnretthunkExtern as u64,
+    FnRetThunkExtern = AttributeId::FnRetThunkExtern as u64,
     /// `skipprofile`
     SkipProfile = AttributeId::SkipProfile as u64,
+    /// Pointer argument is writable.
+    ///
+    /// `writable`
+    Writable = AttributeId::Writable as u64,
+    /// `dead_on_unwind`
+    DeadOnUnwind = AttributeId::DeadOnUnwind as u64,
 }
 
 impl TryFrom<AttributeId> for EnumAttribute {
