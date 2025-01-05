@@ -12,6 +12,12 @@ pub mod bitcodes;
 pub mod opcode;
 pub mod ty;
 
+#[macro_use]
+pub mod ap_int;
+
+// Re-export apint crate
+pub use apint::*;
+
 use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 pub use self::align::*;
