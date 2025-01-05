@@ -4,7 +4,7 @@ use std::convert::{TryFrom, TryInto};
 
 use hashbrown::HashMap;
 use llvm_support::bitcodes::AttributeCode;
-use llvm_support::{AttributeId, AttributeKind, MaybeAlign};
+use llvm_support::{slice_to_apint, ApInt, AttributeId, AttributeKind, MaybeAlign};
 use num_enum::{TryFromPrimitive, TryFromPrimitiveError};
 use thiserror::Error;
 
@@ -390,6 +390,122 @@ impl TryFrom<AttributeId> for TypeAttribute {
     }
 }
 
+/// Represents an integer constant range attribute.
+/// Although undocumented, this is PARAMMATR_GRP_CODE_ENTRY code 7.
+///
+/// See the LLVM Bitcode File Format's
+/// [PARAMATTR_GRP_CODE_ENTRY Record](https://llvm.org/docs/BitCodeFormat.html#paramattr-grp-code-entry-record)
+/// for more details.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstantRangeAttribute {
+    /// Represent a range of possible values that may occur when the program is run
+    /// for an integral value.  This keeps track of a lower and upper bound for the
+    /// constant, which MAY wrap around the end of the numeric range.  To do this, it
+    /// keeps track of a [lower, upper) bound, which specifies an interval just like
+    /// STL iterators.  When used with boolean values, the following are important
+    /// ranges: :
+    ///
+    ///  [F, F) = {}     = Empty set
+    ///  [T, F) = {T}
+    ///  [F, T) = {F}
+    ///  [T, T) = {F, T} = Full set
+    ///
+    /// The other integral ranges use min/max values for special range values. For
+    /// example, for 8-bit types, it uses:
+    /// [0, 0)     = {}       = Empty set
+    /// [255, 255) = {0..255} = Full Set
+    ///
+    /// Note that ConstantRange can be used to represent either signed or
+    /// unsigned ranges.
+    ///
+    /// From llvm/IR/ConstantRange.h
+    Range(ApInt, ApInt),
+}
+
+impl ConstantRangeAttribute {
+    #[inline(always)]
+    /// Decode a signed value stored with the sign bit in the LSB for dense
+    /// VBR encoding.
+    pub fn decode_sign_rotated_value(value: u64) -> u64 {
+        if value & 1 == 0 {
+            value >> 1
+        } else if value != 1 {
+            // C equivalent of -(V >> 1)
+            !(value >> 1) + 1
+        } else {
+            // There is no such thing as -0 with integers. "-0" really means
+            // MININT.
+            (1 as u64) << 63
+        }
+    }
+
+    #[inline]
+    /// Decodes a slice of sign rotated words and collects them into an ApInt.
+    pub fn read_wide_ap_int(values: &[u64]) -> ApInt {
+        let words = values
+            .iter()
+            .map(|&v| Self::decode_sign_rotated_value(v))
+            .collect::<Vec<u64>>();
+
+        slice_to_apint!(u64, words.as_slice())
+    }
+}
+
+impl TryFrom<(&mut usize, AttributeId, u64, &[u64])> for ConstantRangeAttribute {
+    type Error = AttributeError;
+
+    fn try_from(
+        (field_count, key, bit_width, mut data): (&mut usize, AttributeId, u64, &[u64]),
+    ) -> Result<Self, Self::Error> {
+        use ConstantRangeAttribute as Impl;
+
+        match key {
+            // See BitcodeReader::readConstantRange in llvm/Bitcode/Reader.cpp
+            // for LLVM implementation
+            AttributeId::Range => {
+                // Too few records for range
+                if data.len() < 2 {
+                    return Err(AttributeError::TooShort);
+                }
+
+                let (start, end) = if bit_width > 64 {
+                    // Retrieve the count of active lower and upper words
+                    let lo_words = data[0] as usize;
+                    let hi_words = (data[1] >> 32) as usize;
+                    *field_count += 2;
+
+                    // Advance records and check for the next  lower and upper
+                    // word records
+                    data = &data[2..];
+                    if data.len() < lo_words + hi_words {
+                        return Err(AttributeError::TooShort);
+                    }
+
+                    let lower = Impl::read_wide_ap_int(&data[..lo_words]);
+                    let upper = Impl::read_wide_ap_int(&data[lo_words..lo_words + hi_words]);
+                    *field_count += lo_words + hi_words;
+
+                    (lower, upper)
+                }
+                // The data range is encoded within the next two fields
+                else {
+                    // Read then decode the next two values, and keep track of
+                    // the field offset.
+                    let start = Impl::decode_sign_rotated_value(data[0]).into();
+                    let end = Impl::decode_sign_rotated_value(data[1]).into();
+                    *field_count += 2;
+
+                    (start, end)
+                };
+
+                Ok(Impl::Range(start, end))
+            }
+            id => Err(AttributeError::IntAttributeUnsupported(id)),
+        }
+    }
+}
+
 /// Represents a single, concrete LLVM attribute.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,6 +518,9 @@ pub enum Attribute {
     Str(String),
     /// An arbitrary string attribute with a string value.
     StrKeyValue(String, String),
+    /// A range of possible values that may occur when a program is run for an
+    /// integral value.
+    ConstantRange(ConstantRangeAttribute),
 }
 
 impl Attribute {
@@ -453,8 +572,12 @@ impl Attribute {
         //  [kind, key[...], [value[...]]]
         // ...where `kind` indicates the general attribute structure
         // (integral or string, single-value or key-value).
-        let kind = AttributeKind::try_from(next!()?)?;
-        match kind {
+        let kind_id = next!()?;
+
+        let kind = AttributeKind::try_from(kind_id)
+            .inspect_err(|e| log::error!("failed to resolve attribute kind of {}", e.number))?;
+
+        let attribute = match kind {
             AttributeKind::Enum => {
                 // Enum attributes: one key field, nothing else.
                 let key = AttributeId::try_from(next!()?)?;
@@ -481,7 +604,35 @@ impl Attribute {
 
                 Ok((fieldcount, Attribute::StrKeyValue(key, value)))
             }
-        }
+            AttributeKind::ConstantRange => {
+                let key = AttributeId::try_from(next!()?)?;
+                let bit_width = next!()?;
+                let words = &record.fields()[start..start + fieldcount];
+
+                let res = Attribute::ConstantRange(TryInto::try_into((
+                    &mut fieldcount,
+                    key,
+                    bit_width,
+                    words,
+                ))?);
+
+                Ok((fieldcount, res))
+            }
+            AttributeKind::ConstantRangeList => {
+                unimplemented!()
+            }
+        };
+
+        // Show what the attributes resolve to, only in debug mode for
+        // performance.
+        #[cfg(debug_assertions)]
+        if let Some((_, attr)) = attribute.as_ref().ok() {
+            log::debug!("attribute {} resolves to {:?}", kind_id, attr);
+        } else {
+            log::debug!("failed to resolve attribute {}", kind_id);
+        };
+
+        attribute
     }
 }
 
@@ -631,5 +782,24 @@ impl TryFrom<&'_ Block> for AttributeGroups {
         }
 
         Ok(AttributeGroups(groups))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_sign_rotated_value() {
+        const V1: u64 = 5;
+        const V2: u64 = 224;
+
+        let d1 = ConstantRangeAttribute::decode_sign_rotated_value(V1);
+        let d2 = ConstantRangeAttribute::decode_sign_rotated_value(V2);
+
+        assert_eq!(d1, 18446744073709551614);
+        assert_eq!(d2, 112);
+        assert_eq!(d1 as i64, -2);
+        assert_eq!(d2 as i64, 112);
     }
 }
