@@ -361,6 +361,35 @@ impl TryFrom<(AttributeId, u64)> for IntAttribute {
     }
 }
 
+/// Represents a type attribute.
+#[non_exhaustive]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, TryFromPrimitive)]
+#[repr(u64)]
+pub enum TypeAttribute {
+    /// Pass structure by value (`byval`).  
+    ByVal = AttributeId::ByVal as u64,
+    /// Mark in-memory ABI type (`byref`).
+    ByRef = AttributeId::ByRef as u64,
+    /// Provide pointer element type to intrinsic (`elementtype`).
+    ElementType = AttributeId::ElementType as u64,
+    /// Pass structure in an alloca (`inalloca`).
+    InAlloca = AttributeId::InAlloca as u64,
+    /// Similar to `byval` but without a copy (`preallocated`).
+    Preallocated = AttributeId::Preallocated as u64,
+    /// Hidden pointer to structure to return (`sret`).
+    StructRet = AttributeId::StructRet as u64,
+}
+
+impl TryFrom<AttributeId> for TypeAttribute {
+    type Error = AttributeError;
+
+    fn try_from(value: AttributeId) -> Result<Self, Self::Error> {
+        (value as u64)
+            .try_into()
+            .map_err(|_| AttributeError::AttributeMalformed("non-type attribute ID given", value))
+    }
+}
+
 /// Represents a single, concrete LLVM attribute.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
